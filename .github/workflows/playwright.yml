@@ -1,0 +1,67 @@
+name: CollabBoard automated tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # lets you press "Run workflow" manually in the Actions tab
+
+# The tests use one shared live app and database, so never run two at the same time.
+concurrency:
+  group: collabboard-tests
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_URL: https://collab-board-coral.vercel.app
+      API_URL: https://collabboard-7xlz.onrender.com
+      CLERK_PUBLISHABLE_KEY: ${{ secrets.CLERK_PUBLISHABLE_KEY }}
+      CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER2_EMAIL: ${{ secrets.TEST_USER2_EMAIL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      # The backend is on a free tier and sleeps when idle; wake it up before testing.
+      - name: Wake up the backend
+        run: curl --silent --show-error --retry 6 --retry-delay 10 --retry-all-errors --max-time 60 "$API_URL/health"
+
+      - name: Playwright - UI, real-time and API tests
+        run: npx playwright test --project=chromium --project=api
+
+      # Newman needs the Clerk session id that the Playwright login step saved.
+      - name: Postman collection via Newman
+        if: always()
+        run: |
+          SESSION_ID=$(node -p "require('./.auth/token.json').sessionId")
+          npx newman run postman/collabboard.postman_collection.json \
+            --env-var "baseUrl=$API_URL" \
+            --env-var "clerkSecretKey=$CLERK_SECRET_KEY" \
+            --env-var "sessionId=$SESSION_ID" \
+            -r cli,htmlextra --reporter-htmlextra-export postman/report.html
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            playwright-report/
+            test-results/
+            postman/report.html
+          if-no-files-found: ignore
+          retention-days: 30

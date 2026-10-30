@@ -17,7 +17,8 @@ const BASE_URL = process.env.BASE_URL ?? 'https://collab-board-coral.vercel.app'
 const API_URL = process.env.API_URL ?? 'https://collabboard-7xlz.onrender.com';
 
 const USER_B = {
-  email: process.env.TEST_USER2_EMAIL ?? 'collab.tester2+clerk_test@example.com',
+  // `||` (not `??`) so an empty value, e.g. a missing CI secret, also falls back to the default.
+  email: process.env.TEST_USER2_EMAIL || 'collab.tester2+clerk_test@example.com',
   firstName: 'Riya',
   lastName: 'Tester',
 };
@@ -125,15 +126,15 @@ test.describe('Real-time multi-user sync', () => {
   });
 
   test('drawn shapes persist: a fresh reload still shows them', async () => {
-    // KNOWN DEFECT (DEF-03): shapes are not restored after a reload, even with A still
-    // connected and ~12 reload attempts over 20s. test.fail() keeps the suite green while the
-    // bug is open; once the app is fixed this test "unexpectedly passes" and Playwright
-    // flags it, which is the signal to delete this line.
-    test.fail(true, 'DEF-03: canvas shapes are not restored when a client reloads the board');
-
+    // The app saves a snapshot 2 seconds after the last change, and reloading before that
+    // cancels the save (see persistence-timing.spec.ts). Wait for the save to finish first.
+    // Earlier runs without this wait were flaky (passed 1 of 3), which is why it is here.
     const expected = await boardA.shapeCount();
     expect(expected).toBeGreaterThanOrEqual(2);
-    await boardB.reloadUntilShapeCount(expected, { timeout: 20_000 });
+    await pageB.waitForTimeout(3_000);
+    await pageB.reload();
+    await boardB.waitForConnected();
+    await boardB.waitForShapeCount(expected);
   });
 
   test('diagnostic: record what the original user sees after reloading', async () => {
@@ -157,10 +158,12 @@ test.describe('Real-time multi-user sync', () => {
   });
 
   test('drawn shapes survive when everyone leaves and the board is reopened', async () => {
-    // KNOWN DEFECT (DEF-02): the server keeps the canvas only in an in-memory Map
-    // (server yjs provider) and deletes it when the last user disconnects, so an emptied
-    // board loses its drawing. Must stay the LAST test because it closes every page.
-    test.fail(true, 'DEF-02: board contents are deleted when the last user leaves');
+    // KNOWN DEFECT (DEF-02): a change made in the 2 seconds before the user leaves is lost.
+    // The browser saves a snapshot 2s after the last change and leaving cancels that pending
+    // save; the server also forgets the live board when the last user disconnects. This test
+    // draws and leaves straight away, so the new shape is not saved. Must stay the LAST test
+    // because it closes every page. The exact mechanism is proven in persistence-timing.spec.ts.
+    test.fail(true, 'DEF-02: a drawing made within 2s of leaving is lost (pending save cancelled)');
 
     const roomUrl = pageA.url();
     await boardA.drawRectangle(200, 200, 100, 80);
@@ -169,7 +172,7 @@ test.describe('Real-time multi-user sync', () => {
 
     await pageA.close();
     if (!pageB.isClosed()) await pageB.close();
-    await new Promise((r) => setTimeout(r, 5_000));  
+    await new Promise((r) => setTimeout(r, 5_000)); // let the server forget the empty board
 
     const fresh = await contextA.newPage();
     const boardFresh = new BoardPage(fresh);

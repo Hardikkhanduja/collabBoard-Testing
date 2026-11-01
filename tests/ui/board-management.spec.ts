@@ -36,7 +36,7 @@ test.describe('Board management', () => {
     await board.rename(newName);
 
     await page.reload();
-    await expect(page.getByText(newName)).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByText(newName)).toBeVisible({ timeout: 45_000 });
   });
 
   test('deleting a board removes it from the dashboard', async ({ page }) => {

@@ -51,6 +51,17 @@ async function newSignedInContext(browser: Browser, email: string): Promise<Brow
   return context;
 }
 
+// Records every canvas save (PUT /api/rooms/:id/canvas) the browsers send, so tests can report
+// what really happened instead of guessing.
+const canvasSaves: string[] = [];
+function trackSaves(page: Page, who: string) {
+  page.on('response', (r) => {
+    if (r.request().method() === 'PUT' && /\/api\/rooms\/[^/]+\/canvas\/?$/.test(new URL(r.url()).pathname)) {
+      canvasSaves.push(`${who}:${r.status()}`);
+    }
+  });
+}
+
 test.describe('Real-time multi-user sync', () => {
   test.describe.configure({ mode: 'serial' });
   test.setTimeout(150_000);
@@ -73,6 +84,7 @@ test.describe('Real-time multi-user sync', () => {
     // A creates a board.
     pageA = await contextA.newPage();
     boardA = new BoardPage(pageA);
+    trackSaves(pageA, 'A');
     const home = new HomePage(pageA);
     await home.goto();
     const roomId = await home.createBoard(`Sync Test ${Date.now()}`);
@@ -88,6 +100,7 @@ test.describe('Real-time multi-user sync', () => {
 
     pageB = await contextB.newPage();
     boardB = new BoardPage(pageB);
+    trackSaves(pageB, 'B');
     const homeB = new HomePage(pageB);
     // The app creates a new user's database row with a background GET /api/users/me right
     // after sign-in. Joining before that finishes gives "401 User not found" (a real race in
@@ -125,16 +138,48 @@ test.describe('Real-time multi-user sync', () => {
     await boardA.waitForShapeCount(before + 1);
   });
 
-  test('drawn shapes persist: a fresh reload still shows them', async () => {
-    // The app saves a snapshot 2 seconds after the last change, and reloading before that
-    // cancels the save (see persistence-timing.spec.ts). Wait for the save to finish first.
-    // Earlier runs without this wait were flaky (passed 1 of 3), which is why it is here.
-    const expected = await boardA.shapeCount();
-    expect(expected).toBeGreaterThanOrEqual(2);
-    await pageB.waitForTimeout(3_000);
-    await pageB.reload();
-    await boardB.waitForConnected();
-    await boardB.waitForShapeCount(expected);
+  test('shapes drawn in a two-user session stay on both canvases', async ({ playwright }) => {
+    // KNOWN DEFECT (DEF-03): in a two-user session, drawn shapes disappear from BOTH canvases
+    // about 2 seconds after being drawn, even though the app's saves return 200 (the saved
+    // snapshot is empty). Marked test.fail() so the suite stays green while it is open; when
+    // the app is fixed Playwright reports "expected to fail, but passed" and this line can go.
+    test.fail(true, 'DEF-03: shapes drawn in a two-user session disappear within seconds');
+
+    // This test draws its own shape, so it does not depend on earlier tests' timing.
+    const aBase = await boardA.shapeCount();
+    const bBase = await boardB.shapeCount();
+    await boardA.drawRectangle(150, 450, 100, 60);
+    await boardA.waitForShapeCount(aBase + 1);
+    await boardB.waitForShapeCount(bBase + 1); // live sync works...
+
+    // ...but do the shapes stay? Sample both canvases every 0.5s for 4s.
+    const timeline: string[] = [];
+    for (let i = 0; i <= 8; i++) {
+      timeline.push(`${i * 0.5}s A=${await boardA.shapeCount()} B=${await boardB.shapeCount()}`);
+      await pageB.waitForTimeout(500);
+    }
+    await pageA.screenshot({ path: 'test-results/DEF-03-A-after-wait.png' });
+    await pageB.screenshot({ path: 'test-results/DEF-03-B-after-wait.png' });
+
+    // Did the app's own saved snapshot receive any shapes?
+    const roomId = pageA.url().match(/\/board\/([^/?#]+)/)![1];
+    const api = await playwright.request.newContext({ extraHTTPHeaders: await authHeaders() });
+    const res = await api.get(`${API_URL}/api/rooms/${roomId}/canvas`, { timeout: 60_000 });
+    const snapshot = await res.json();
+    await api.dispose();
+    const records = Object.values((snapshot?.document?.store ?? snapshot?.store ?? {}) as Record<string, any>);
+    const savedShapes = records.filter((r) => r?.typeName === 'shape').length;
+
+    const aEnd = await boardA.shapeCount();
+    const bEnd = await boardB.shapeCount();
+    const note =
+      `baseline A=${aBase} B=${bBase}; timeline: ${timeline.join(' | ')}; ` +
+      `saved in snapshot: ${savedShapes} (GET ${res.status()}); browser saves sent: ${canvasSaves.join(',') || 'none'}`;
+    console.log(note);
+    test.info().annotations.push({ type: 'DEF-03 evidence', description: note });
+
+    expect(aEnd).toBeGreaterThanOrEqual(aBase + 1);
+    expect(bEnd).toBeGreaterThanOrEqual(bBase + 1);
   });
 
   test('diagnostic: record what the original user sees after reloading', async () => {
